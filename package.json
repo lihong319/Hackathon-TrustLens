@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "vite build",
+    "postbuild": "node scripts/wrap-worker.mjs",
     "build:next": "next build",
     "start": "next start",
     "lint": "tsc --noEmit"
