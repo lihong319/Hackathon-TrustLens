@@ -1,0 +1,30 @@
+{
+  "name": "trustlens-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "vite build",
+    "build:next": "next build",
+    "start": "next start",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "latest",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@openai/sites-vite-plugin": "^0.2.0",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-rsc": "^0.5.34",
+    "react-server-dom-webpack": "^19.2.8",
+    "typescript": "latest",
+    "vinext": "^1.0.0-beta.8",
+    "vite": "^8.2.2"
+  }
+}

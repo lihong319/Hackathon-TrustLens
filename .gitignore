@@ -1,0 +1,14 @@
+# dependencies
+/node_modules
+
+# framework output
+/.next
+/dist
+
+# local tooling
+*.log
+.DS_Store
+
+# environment files
+.env*
+!.env.example
