@@ -1,0 +1,6 @@
+[package]
+name = "trust_lens"
+edition = "2024"
+
+[addresses]
+trust_lens = "0x0"

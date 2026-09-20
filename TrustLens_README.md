@@ -376,22 +376,22 @@ The hackathon MVP should remain small and reliable.
 
 ### Must Have
 
-- [ ] User can enter text or a URL.
-- [ ] Content is sent through Gonka Router.
-- [ ] Multiple AI models analyze the content.
-- [ ] TrustLens calculates a Trust Score.
-- [ ] TrustLens displays a risk level.
-- [ ] TrustLens displays understandable reasoning.
-- [ ] Gonka Request IDs are shown.
+- [x] User can enter text or a URL.
+- [x] Content is sent through Gonka Router.
+- [x] Multiple AI models analyze the content.
+- [x] TrustLens calculates a Trust Score.
+- [x] TrustLens displays a risk level.
+- [x] TrustLens displays understandable reasoning.
+- [x] Gonka Request IDs are shown.
 - [ ] User can create a verification proof on Sui.
 - [ ] User can view the Sui transaction / verification result.
-- [ ] A clean and simple web interface.
+- [x] A clean and simple web interface.
 - [ ] Working end-to-end live demo.
 
 ### Good to Have
 
-- [ ] Shareable verification link.
-- [ ] Verification history.
+- [x] Shareable verification link.
+- [x] Verification history.
 - [ ] Community report count.
 - [ ] Multilingual analysis.
 - [ ] URL/domain reputation.
@@ -902,6 +902,70 @@ The goal is simple:
 **Blockchain:** Sui  
 **MVP:** Text/URL → Multi-model verification → Trust Score → Sui verification proof  
 **Main Goal:** Deliver a polished, reliable, easy-to-understand live demonstration that meaningfully satisfies both sponsor tracks.
+
+---
+
+## 28. Current Backend and AI Setup
+
+The MVP now exposes POST /api/analyze. The route:
+
+1. Validates text or HTTP(S) URL input.
+2. Hashes the normalized input with SHA-256.
+3. Sends exactly one parallel request to each of three Gonka models.
+4. Validates their structured assessments.
+5. Produces a confidence-weighted Trust Score and consensus.
+6. Returns the content hash, reasoning, warnings, recommendations, and Gonka request IDs.
+
+The default models are:
+
+- MiniMaxAI/MiniMax-M2.7
+- moonshotai/Kimi-K2.6
+- deepseek-ai/DeepSeek-V4-Flash-0731
+
+### Local configuration
+
+Copy .env.example to .env.local and set:
+
+~~~text
+GONKA_API_KEY=your_server_side_key
+NEXT_PUBLIC_SUI_PACKAGE_ID=your_published_testnet_package_id
+~~~
+
+Never prefix the secret Gonka key with NEXT_PUBLIC_ and never commit
+.env.local. The Sui package ID is public blockchain metadata, so it is safe and
+necessary to expose it to the browser.
+
+### Local Sui wallet testing
+
+- Open the app in a normal Chrome or Edge tab at http://localhost:3000.
+- Allow pop-ups for localhost before selecting the Slush web wallet.
+- Alternatively, install the Slush browser extension.
+- Local development also exposes dApp Kit's test-only Burner Wallet. Never use
+  that burner wallet for mainnet funds; it is disabled in production builds.
+- Set the connected wallet to Sui Testnet and obtain free gas from the official
+  Sui Testnet faucet before creating a proof.
+
+### No-charge safeguards
+
+- There is no paid-provider fallback.
+- Each click makes exactly three model calls with no automatic retry.
+- Input is limited to 2,000 characters.
+- Each model output is limited to 1,024 tokens.
+- Without GONKA_API_KEY, the API fails closed with GONKA_NOT_CONFIGURED.
+
+Use only GonkaRouter's free starter credit and do not add a payment method or
+enable automatic top-ups. When the free credit is exhausted, analysis should
+stop rather than charge a card.
+
+### Database decision
+
+No central database is used in this phase. Submitted content is processed in
+memory, hashed, and discarded after the response. This matches the
+privacy-first blueprint. Long-lived verification records are represented by
+user-owned Sui Testnet objects, while the five most recent object links are
+cached only in that browser's local storage. A separate database is unnecessary
+for the MVP and can be added later only for optional global indexing or
+community reporting.
 
 ---
 

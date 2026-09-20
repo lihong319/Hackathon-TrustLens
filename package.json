@@ -9,9 +9,11 @@
     "postbuild": "node scripts/wrap-worker.mjs",
     "build:next": "next build",
     "start": "next start",
-    "lint": "tsc --noEmit"
+    "lint": "next typegen && tsc --noEmit"
   },
   "dependencies": {
+    "@mysten/dapp-kit-react": "^2.1.25",
+    "@mysten/sui": "^2.29.0",
     "lucide-react": "latest",
     "next": "latest",
     "react": "latest",

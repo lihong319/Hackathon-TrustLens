@@ -7,8 +7,11 @@
 
 # local tooling
 *.log
+*.tsbuildinfo
 .DS_Store
 /.wrangler
+/.tools
+/move/build
 
 # environment files
 .env*

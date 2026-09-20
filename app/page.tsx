@@ -21,7 +21,58 @@ import {
   Sparkles,
   Zap,
 } from "lucide-react";
+import { useCurrentAccount, useDAppKit } from "@mysten/dapp-kit-react";
+import { Transaction } from "@mysten/sui/transactions";
+import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
+import type {
+  AnalysisResult,
+  AnalyzeError,
+  RiskLevel,
+} from "../lib/trustlens/types";
+
+const DAppKitClientProvider = dynamic(
+  () =>
+    import("./sui/client-provider").then(
+      (module) => module.DAppKitClientProvider,
+    ),
+  { ssr: false },
+);
+
+const ConnectButton = dynamic(
+  () => import("./sui/client-provider").then((module) => module.ConnectButton),
+  { ssr: false, loading: () => <button className="wallet-loading" disabled>Loading wallet…</button> },
+);
+
+const HISTORY_KEY = "trustlens-sui-proof-history";
+const SUI_PACKAGE_ID = process.env.NEXT_PUBLIC_SUI_PACKAGE_ID?.trim();
+
+type SuiProof = {
+  objectId: string;
+  digest: string;
+  owner: string;
+  verificationId: string;
+  contentHash: string;
+  resultHash: string;
+  trustScore: number;
+  riskLevel: RiskLevel;
+  createdAt: string;
+};
+
+function hexToBytes(value: string) {
+  const hex = value.startsWith("0x") ? value.slice(2) : value;
+  if (!hex || hex.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(hex)) {
+    throw new Error("The proof hash is not valid hexadecimal data.");
+  }
+  return Uint8Array.from(
+    { length: hex.length / 2 },
+    (_, index) => Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16),
+  );
+}
+
+function shortId(value: string) {
+  return value.length > 18 ? `${value.slice(0, 10)}…${value.slice(-6)}` : value;
+}
 
 const examples = [
   "Government aid message",
@@ -30,16 +81,36 @@ const examples = [
 ];
 
 export default function Home() {
+  return (
+    <DAppKitClientProvider>
+      <TrustLensApp />
+    </DAppKitClientProvider>
+  );
+}
+
+function TrustLensApp() {
+  const account = useCurrentAccount();
+  const dAppKit = useDAppKit();
   const [mode, setMode] = useState<"text" | "url">("text");
   const [content, setContent] = useState("");
   const [view, setView] = useState<"input" | "analyzing" | "result" | "proof">("input");
   const [copied, setCopied] = useState(false);
+  const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [showReasoning, setShowReasoning] = useState(false);
+  const [proof, setProof] = useState<SuiProof | null>(null);
+  const [proofStatus, setProofStatus] = useState<"idle" | "signing" | "error">("idle");
+  const [proofError, setProofError] = useState("");
+  const [history, setHistory] = useState<SuiProof[]>([]);
 
   useEffect(() => {
-    if (view !== "analyzing") return;
-    const timer = window.setTimeout(() => setView("result"), 2200);
-    return () => window.clearTimeout(timer);
-  }, [view]);
+    try {
+      const saved = window.localStorage.getItem(HISTORY_KEY);
+      if (saved) setHistory(JSON.parse(saved) as SuiProof[]);
+    } catch {
+      window.localStorage.removeItem(HISTORY_KEY);
+    }
+  }, []);
 
   const loadExample = (example: string) => {
     setMode("text");
@@ -56,12 +127,139 @@ export default function Home() {
     setView("input");
     setContent("");
     setCopied(false);
+    setResult(null);
+    setErrorMessage("");
+    setShowReasoning(false);
+    setProof(null);
+    setProofStatus("idle");
+    setProofError("");
   };
 
   const copyProof = async () => {
-    await navigator.clipboard?.writeText("trustlens.app/verify/0x8F3A71C2");
+    if (!result || !proof) return;
+    await navigator.clipboard?.writeText(
+      `${window.location.origin}/verify/${proof.objectId}`,
+    );
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1800);
+  };
+
+  const createSuiProof = async () => {
+    if (!result) return;
+    setProofError("");
+
+    if (!account) {
+      setProofStatus("error");
+      setProofError("Connect a Sui wallet before creating an on-chain proof.");
+      return;
+    }
+    if (!SUI_PACKAGE_ID) {
+      setProofStatus("error");
+      setProofError(
+        "The TrustLens Move package has not been published yet. Add NEXT_PUBLIC_SUI_PACKAGE_ID after publishing it to Sui Testnet.",
+      );
+      return;
+    }
+
+    setProofStatus("signing");
+    try {
+      const riskCode: Record<RiskLevel, number> = {
+        LOW: 0,
+        MEDIUM: 1,
+        HIGH: 2,
+        UNVERIFIABLE: 3,
+      };
+      const transaction = new Transaction();
+      transaction.moveCall({
+        target: `${SUI_PACKAGE_ID}::verification::create_verification`,
+        arguments: [
+          transaction.pure.string(result.verificationId),
+          transaction.pure.vector("u8", hexToBytes(result.contentHash)),
+          transaction.pure.vector("u8", hexToBytes(result.resultHash)),
+          transaction.pure.u8(result.trustScore),
+          transaction.pure.u8(riskCode[result.riskLevel]),
+          transaction.pure.u64(Date.parse(result.createdAt)),
+          transaction.pure.vector(
+            "string",
+            result.models.map((model) => model.requestId),
+          ),
+        ],
+      });
+
+      const execution = await dAppKit.signAndExecuteTransaction({ transaction });
+      if (execution.FailedTransaction) {
+        throw new Error(
+          execution.FailedTransaction.status.error?.message ??
+            "The Sui transaction failed.",
+        );
+      }
+
+      const createdObject = execution.Transaction.effects?.changedObjects.find(
+        (object) =>
+          object.idOperation === "Created" &&
+          object.outputState === "ObjectWrite",
+      );
+      if (!createdObject) {
+        throw new Error(
+          "Sui accepted the transaction, but the verification object was not returned.",
+        );
+      }
+
+      const savedProof: SuiProof = {
+        objectId: createdObject.objectId,
+        digest: execution.Transaction.digest,
+        owner: account.address,
+        verificationId: result.verificationId,
+        contentHash: result.contentHash,
+        resultHash: result.resultHash,
+        trustScore: result.trustScore,
+        riskLevel: result.riskLevel,
+        createdAt: result.createdAt,
+      };
+      const updatedHistory = [
+        savedProof,
+        ...history.filter((item) => item.objectId !== savedProof.objectId),
+      ].slice(0, 5);
+      window.localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
+      setHistory(updatedHistory);
+      setProof(savedProof);
+      setProofStatus("idle");
+      setView("proof");
+    } catch (error) {
+      setProofStatus("error");
+      setProofError(
+        error instanceof Error
+          ? error.message
+          : "The Sui transaction could not be completed.",
+      );
+    }
+  };
+
+  const analyze = async () => {
+    setErrorMessage("");
+    setShowReasoning(false);
+    setView("analyzing");
+
+    try {
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, content }),
+      });
+      const body = (await response.json()) as AnalysisResult | AnalyzeError;
+      if (!response.ok || "error" in body) {
+        throw new Error("error" in body ? body.error : "Analysis failed.");
+      }
+      setResult(body);
+      setView("result");
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "TrustLens could not complete this analysis.",
+      );
+      setView("input");
+    }
   };
 
   return (
@@ -81,7 +279,7 @@ export default function Home() {
         </nav>
         <div className="header-actions">
           <span className="network-pill"><i /> Sui Testnet</span>
-          <a className="button button-small button-dark" href="#verify">Launch app <ArrowRight size={15} /></a>
+          <ConnectButton />
         </div>
       </header>
 
@@ -149,7 +347,8 @@ export default function Home() {
               </div>
             </div>
 
-            <button className="analyze-button" disabled={!content.trim()} onClick={() => setView("analyzing")}>
+            {errorMessage && <div className="analysis-error" role="alert"><AlertTriangle size={16} /><span>{errorMessage}</span></div>}
+            <button className="analyze-button" disabled={!content.trim()} onClick={analyze}>
               <ScanSearch size={19} /> Analyze with TrustLens <ArrowRight size={17} />
             </button>
             <p className="privacy-note"><LockKeyhole size={12} /> Your original content is never stored on-chain. Only its cryptographic fingerprint is recorded.</p>
@@ -162,52 +361,64 @@ export default function Home() {
               <p>Independent models are reviewing language, source signals and known scam patterns.</p>
               <div className="progress-track"><span /></div>
               <div className="model-progress">
-                <div><span className="model-symbol">A</span><p><strong>Gonka Model A</strong><small>Analyzing persuasion patterns</small></p><span className="working-dots"><i /><i /><i /></span></div>
-                <div><span className="model-symbol coral-model">B</span><p><strong>Gonka Model B</strong><small>Checking claim credibility</small></p><Check size={16} /></div>
-                <div><span className="model-symbol yellow-model">C</span><p><strong>Gonka Model C</strong><small>Scanning for phishing signals</small></p><span className="working-dots"><i /><i /><i /></span></div>
+                <div><span className="model-symbol">M</span><p><strong>MiniMax M2.7</strong><small>Analyzing persuasion patterns</small></p><span className="working-dots"><i /><i /><i /></span></div>
+                <div><span className="model-symbol coral-model">K</span><p><strong>Kimi K2.6</strong><small>Checking claim credibility</small></p><Check size={16} /></div>
+                <div><span className="model-symbol yellow-model">D</span><p><strong>DeepSeek V4 Flash</strong><small>Scanning for phishing signals</small></p><span className="working-dots"><i /><i /><i /></span></div>
               </div>
               <p className="privacy-note"><LockKeyhole size={12} /> Analysis is routed privately through Gonka</p>
             </div>}
 
-            {view === "result" && <div className="result-view" aria-live="polite">
+            {view === "result" && result && <div className="result-view" aria-live="polite">
               <div className="result-topline">
-                <div><span className="overline">TRUSTLENS RESULT</span><h2>High-risk content detected</h2></div>
+                <div><span className="overline">TRUSTLENS RESULT</span><h2>{result.assessment}</h2></div>
                 <button className="icon-button" onClick={resetCheck} aria-label="Start a new check"><RotateCcw size={16} /></button>
               </div>
               <div className="score-summary">
-                <div className="score-ring"><div><strong>14</strong><span>/ 100</span></div></div>
-                <div className="score-copy"><span className="risk-pill"><AlertTriangle size={13} /> High risk</span><h3>Likely fraudulent</h3><p>Strong scam indicators found across all three AI assessments.</p></div>
+                <div className={`score-ring risk-${result.riskLevel.toLowerCase()}`}><div><strong>{result.trustScore}</strong><span>/ 100</span></div></div>
+                <div className="score-copy"><span className={`risk-pill risk-${result.riskLevel.toLowerCase()}`}>{result.riskLevel === "LOW" ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />} {result.riskLevel === "UNVERIFIABLE" ? "Unverifiable" : `${result.riskLevel} risk`}</span><h3>{result.consensus.summary}</h3><p>Weighted from {result.consensus.completed} independent Gonka model assessments.</p></div>
               </div>
               <div className="warning-panel">
                 <span className="panel-icon"><AlertTriangle size={17} /></span>
-                <div><h4>Warning signals</h4><ul><li>Urgent call to action</li><li>Unverifiable financial incentive</li><li>Suspicious lookalike domain</li></ul></div>
+                <div>
+                  <h4>Observed warning signals</h4>
+                  <ul>{result.warningSignals.length ? result.warningSignals.map((signal) => <li key={signal}>{signal}</li>) : <li>No concrete scam indicator was identified.</li>}</ul>
+                  {result.evidenceGaps.length > 0 && <><h4 className="evidence-heading">Evidence still needed</h4><ul className="evidence-list">{result.evidenceGaps.map((gap) => <li key={gap}>{gap}</li>)}</ul></>}
+                </div>
               </div>
-              <div className="consensus-heading"><span>MODEL CONSENSUS</span><strong><CheckCircle2 size={14} /> 3 of 3 agree</strong></div>
+              <div className="consensus-heading"><span>MODEL CONSENSUS</span><strong><CheckCircle2 size={14} /> {result.consensus.agreementPercent}% of completed models agree</strong></div>
               <div className="model-verdicts">
-                <div><span>A</span><p>Model A<small>Likely scam · 94%</small></p><AlertTriangle size={15} /></div>
-                <div><span>B</span><p>Model B<small>Likely scam · 89%</small></p><AlertTriangle size={15} /></div>
-                <div><span>C</span><p>Model C<small>Suspicious · 82%</small></p><AlertTriangle size={15} /></div>
+                {result.models.map((model) => <div key={model.model}><span>{model.displayName.charAt(0)}</span><p>{model.displayName}<small>{model.verdict.replaceAll("_", " ")} · {model.confidence}%</small></p>{model.trustScore < 50 ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}</div>)}
               </div>
-              <div className="recommendation"><BrainCircuit size={17} /><p><strong>Recommended action</strong><span>Do not click the link or share personal information. Verify using the organisation’s official channel.</span></p></div>
-              <button className="analyze-button proof-button" onClick={() => setView("proof")}><ShieldCheck size={18} /> Create Sui verification proof <ArrowRight size={16} /></button>
-              <button className="reasoning-button">View reasoning & Gonka Request IDs <ChevronRight size={14} /></button>
+              <div className="recommendation"><BrainCircuit size={17} /><p><strong>Recommended action</strong><span>{result.recommendedAction}</span></p></div>
+              {!account && <div className="wallet-prompt"><span>Connect a Sui Testnet wallet to anchor this result.<small>On localhost, allow pop-ups for Slush or choose the development-only Burner Wallet.</small></span><ConnectButton /></div>}
+              {account && <button className="analyze-button proof-button" disabled={proofStatus === "signing"} onClick={createSuiProof}><ShieldCheck size={18} /> {proofStatus === "signing" ? "Confirm in your wallet…" : "Anchor proof on Sui Testnet"} <ArrowRight size={16} /></button>}
+              {proofError && <div className="analysis-error proof-error" role="alert"><AlertTriangle size={16} /><span>{proofError}</span></div>}
+              <button className="reasoning-button" onClick={() => setShowReasoning((shown) => !shown)}>{showReasoning ? "Hide" : "View"} reasoning & Gonka Request IDs <ChevronRight size={14} /></button>
+              {showReasoning && <div className="reasoning-panel">
+                <h4>Cross-model reasoning</h4>
+                <ul>{result.reasoning.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                <h4>Gonka request IDs</h4>
+                {result.models.map((model) => <code key={model.requestId}>{model.model}: {model.requestId}</code>)}
+                {result.failedModels.map((failure) => <p className="model-failure" key={failure.model}>{failure.displayName}: {failure.message}</p>)}
+              </div>}
             </div>}
 
-            {view === "proof" && <div className="proof-view" aria-live="polite">
+            {view === "proof" && result && proof && <div className="proof-view" aria-live="polite">
               <div className="success-seal"><CheckCircle2 size={34} /></div>
-              <span className="overline">VERIFICATION COMPLETE</span>
-              <h2>Your proof is secured on Sui</h2>
-              <p>The result’s cryptographic fingerprint is now tamper-resistant and ready to share.</p>
+              <span className="overline">ON-CHAIN PROOF CREATED</span>
+              <h2>Your verification is anchored on Sui</h2>
+              <p>The privacy-safe fingerprints and assessment metadata are now stored in a user-owned Sui Testnet object. Your original content remains private.</p>
               <div className="proof-card">
-                <div><span>VERIFICATION ID</span><strong>0x8F3A…71C2</strong></div>
-                <div><span>TRUST SCORE</span><strong className="proof-risk">14 / 100 · HIGH RISK</strong></div>
-                <div><span>CONTENT HASH</span><code>0x19ae74b8…d03f</code></div>
-                <div><span>NETWORK</span><strong><i className="live-dot" /> Sui Testnet</strong></div>
+                <div><span>VERIFICATION ID</span><strong>{result.verificationId}</strong></div>
+                <div><span>TRUST SCORE</span><strong className="proof-risk">{result.trustScore} / 100 · {result.riskLevel}</strong></div>
+                <div><span>CONTENT HASH</span><code>{result.contentHash.slice(0, 18)}…{result.contentHash.slice(-8)}</code></div>
+                <div><span>STATUS</span><strong><i className="live-dot" /> Confirmed on Testnet</strong></div>
               </div>
               <div className="proof-actions">
-                <button className="analyze-button" onClick={copyProof}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? "Link copied" : "Share verification"}</button>
-                <button className="outline-button">View on explorer <ExternalLink size={15} /></button>
+                <button className="analyze-button" onClick={copyProof}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? "Share link copied" : "Copy share link"}</button>
+                <a className="outline-button" href={`https://suivision.xyz/txblock/${proof.digest}?network=testnet`} target="_blank" rel="noreferrer">View transaction <ExternalLink size={15} /></a>
               </div>
+              <a className="proof-object-link" href={`/verify/${proof.objectId}`}>Open public verification record <ArrowRight size={13} /></a>
               <button className="reasoning-button" onClick={resetCheck}><RotateCcw size={13} /> Check something else</button>
             </div>}
           </div>
@@ -245,10 +456,15 @@ export default function Home() {
             <a href="#verify">Run your first check <ArrowRight size={15} /></a>
           </div>
           <div className="record-list">
-            <div className="record-head"><span>RECENT TESTNET VERIFICATIONS</span><span><i /> Live</span></div>
-            <article><span className="record-mark danger"><AlertTriangle size={17} /></span><div><strong>Government aid impersonation</strong><small>Verified 2 min ago · 0x8F3A…71C2</small></div><span className="record-score danger-text">14<small>/100</small></span></article>
-            <article><span className="record-mark safe"><ShieldCheck size={17} /></span><div><strong>Official banking advisory</strong><small>Verified 18 min ago · 0x2C11…9B04</small></div><span className="record-score safe-text">92<small>/100</small></span></article>
-            <article><span className="record-mark caution"><Link2 size={17} /></span><div><strong>Investment return claim</strong><small>Verified 41 min ago · 0x7DA0…E128</small></div><span className="record-score caution-text">31<small>/100</small></span></article>
+            <div className="record-head"><span>YOUR RECENT TESTNET VERIFICATIONS</span><span><i /> On-chain</span></div>
+            {history.length === 0 && <div className="record-empty"><FileCheck2 size={24} /><strong>No proofs created on this device yet</strong><span>Analyze content, connect your wallet, and anchor the result to see it here.</span></div>}
+            {history.map((item) => (
+              <a className="record-row" href={`/verify/${item.objectId}`} key={item.objectId}>
+                <span className={`record-mark ${item.riskLevel === "LOW" ? "safe" : item.riskLevel === "HIGH" ? "danger" : "caution"}`}>{item.riskLevel === "LOW" ? <ShieldCheck size={17} /> : item.riskLevel === "HIGH" ? <AlertTriangle size={17} /> : <Link2 size={17} />}</span>
+                <div><strong>{item.verificationId}</strong><small>{new Date(item.createdAt).toLocaleString()} · {shortId(item.objectId)}</small></div>
+                <span className={`record-score ${item.riskLevel === "LOW" ? "safe-text" : item.riskLevel === "HIGH" ? "danger-text" : "caution-text"}`}>{item.trustScore}<small>/100</small></span>
+              </a>
+            ))}
             <div className="record-foot"><LockKeyhole size={12} /> Original submitted content remains private</div>
           </div>
         </div>
